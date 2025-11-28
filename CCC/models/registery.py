@@ -1,6 +1,5 @@
 """Continual Test Time Adaptation models."""
 from typing import List
-
 import torch.nn as nn
 
 __model_registry = {}
@@ -13,12 +12,12 @@ def _clear_registry():
 
 
 def register(name: str):
-    """Decorator to register a new model"""
+    """Decorator to register a new model."""
     global __model_registry
 
     def _register(cls):
         if name in __model_registry:
-            raise ValueError(f"Duplicate name added to registry: {name}.")
+            raise ValueError(f"Duplicate model name in registry: {name}.")
         __model_registry[name] = cls
         return cls
 
@@ -26,11 +25,17 @@ def register(name: str):
 
 
 def init(name, *args, **kwargs):
-    """Init the specified model using the given arguments."""
+    """
+    Initialize the specified model using the given arguments.
+    Supports keyword arguments for RDumb++ (drift_k, warmup_steps, etc.)
+    """
     global __model_registry
+
     if name not in __model_registry:
-        raise ValueError("Model with name {name} not registered.")
-    return __model_registry[name](*args, **kwargs)
+        raise ValueError(f"Model with name '{name}' not registered.")
+
+    cls = __model_registry[name]
+    return cls(*args, **kwargs)
 
 
 def get_options() -> List[str]:
@@ -40,6 +45,7 @@ def get_options() -> List[str]:
 
 
 class AdaptiveModel(nn.Module):
+    """Base class for all adaptive models."""
     def __init__(self, model):
         super().__init__()
         self.model = model

@@ -1,11 +1,22 @@
 import argparse
 import os
-
 import torch
-import torchvision.models as models
-import torchvision.transforms as trn
-import webdataset as wds
 
+# Import torchvision with error handling for CUDA version mismatches
+try:
+    import torchvision.models as models
+    import torchvision.transforms as trn
+except RuntimeError as e:
+    if "different CUDA versions" in str(e) or "CUDA Version" in str(e):
+        pytorch_cuda = torch.version.cuda if torch.cuda.is_available() else None
+        print(f"\n✗ ERROR: CUDA version mismatch detected!")
+        print(f"  PyTorch CUDA version: {pytorch_cuda}")
+        print(f"  Error: {e}")
+        raise RuntimeError("CUDA and torchvision versions do not match.")
+    else:
+        raise
+
+import webdataset as wds
 from models import registery
 
 
@@ -14,118 +25,125 @@ def identity(x):
 
 
 def get_webds_loader(dset_name, dset_path=None):
-    # Use local dataset if path is provided, otherwise stream from cloud
+    """Load CCC dataset using WebDataset."""
     if dset_path:
         url = os.path.join(dset_path, dset_name, "serial_{{00000..99999}}.tar")
     else:
         url = f'https://mlcloud.uni-tuebingen.de:7443/datasets/CCC/{dset_name}/serial_{{00000..99999}}.tar'
 
-    normalize = trn.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    preproc = trn.Compose(
-        [
-            trn.ToTensor(),
-            normalize,
-        ]
-    )
+    normalize = trn.Normalize(mean=[0.485, 0.456, 0.406],
+                              std=[0.229, 0.224, 0.225])
+
+    preproc = trn.Compose([trn.ToTensor(), normalize])
+
     dataset = (
         wds.WebDataset(url)
         .decode("pil")
         .to_tuple("input.jpg", "output.cls")
         .map_tuple(preproc, identity)
     )
-    dataloader = torch.utils.data.DataLoader(dataset, num_workers=0, batch_size=64)
-    return dataloader
+    loader = torch.utils.data.DataLoader(dataset, batch_size=64, num_workers=0)
+    return loader
 
 
 def test(model, dset_path, file_name=None, local_dset_path=None):
+    """Evaluate accuracy along the CCC stream."""
     total_seen_so_far = 0
     dataset_loader = get_webds_loader(dset_path, local_dset_path)
-    
-    # Get device from model
+
     device = next(model.parameters()).device
 
     for i, (images, labels) in enumerate(dataset_loader):
-        # Use device-agnostic transfer
         images, labels = images.to(device), labels.to(device)
         output = model(images)
 
-        num_images_in_batch = images.size(0)
-        total_seen_so_far += num_images_in_batch
-
-        vals, pred = (output).max(dim=1, keepdim=True)
-        correct_this_batch = pred.eq(labels.view_as(pred)).sum().item()
+        preds = output.argmax(dim=1, keepdim=True)
+        correct = preds.eq(labels.view_as(preds)).sum().item()
 
         with open(file_name, "a+") as f:
-            f.write(
-                ("acc_{:.10f}\n").format(
-                    float(100 * correct_this_batch) / images.size(0)
-                )
-            )
-        if total_seen_so_far > 7500000:
+            f.write(f"acc_{100 * correct / images.size(0):.10f}\n")
+
+        total_seen_so_far += images.size(0)
+        if total_seen_so_far > 7_500_000:
             return
 
 
 def evaluate(args):
     torch.manual_seed(42)
+
     cuda_available = torch.cuda.is_available()
-    
-    # Use GPU if available, otherwise fall back to CPU
+    device = torch.device("cuda" if cuda_available else "cpu")
+
     if cuda_available:
-        device = torch.device("cuda")
         print(f"✓ Using GPU: {torch.cuda.get_device_name(0)}")
     else:
-        device = torch.device("cpu")
-        print("⚠ CUDA not available. Using CPU (this will be slower).")
-    # Convert baseline to int for directory name
-    baseline_int = int(args.baseline)
-    exp_name = "ccc_{}".format(baseline_int)
+        print("⚠ CUDA not available. Running on CPU (slow).")
 
-    if not os.path.exists(os.path.join(args.logs, exp_name)):
-        os.mkdir(os.path.join(args.logs, exp_name))
+    baseline_int = int(args.baseline)
+    exp_name = f"ccc_{baseline_int}"
+
+    os.makedirs(os.path.join(args.logs, exp_name), exist_ok=True)
 
     cur_seed = [43, 44, 45][args.processind % 3]
-    speed = [1000, 2000, 5000][int(args.processind / 3)]
+    speed = [1000, 2000, 5000][args.processind // 3]
 
     file_name = os.path.join(
-        args.logs,
-        exp_name,
-        "model_{}_baseline_{}_transition+speed_{}_seed_{}.txt".format(
-            args.mode, baseline_int, speed, cur_seed
-        ),
+        args.logs, exp_name,
+        f"model_{args.mode}_baseline_{baseline_int}_transition+speed_{speed}_seed_{cur_seed}.txt"
     )
 
-    # Dataset names use integers, not floats (baseline_int already defined above)
-    dset_name = "baseline_{}_transition+speed_{}_seed_{}".format(
-        baseline_int, speed, cur_seed
-    )
-    
-    #dset_name = os.path.join(args.dset, dset_name) Uncomment this to use a local copy of CCC
+    dset_name = f"baseline_{baseline_int}_transition+speed_{speed}_seed_{cur_seed}"
 
-    model = models.resnet50(pretrained=True)
-    model.to(device)
-    # Only use DataParallel if CUDA is available and multiple GPUs exist
+    # Load pretrained backbone
+    model = models.resnet50(pretrained=True).to(device)
+
+    # Multi-GPU support (optional)
     if cuda_available and torch.cuda.device_count() > 1:
-        model = torch.nn.parallel.DataParallel(model)
+        model = torch.nn.DataParallel(model)
 
-    assert args.mode in registery.get_options()
-    if args.mode == "eta" or args.mode == "eata":
-        loader = get_webds_loader(dset_name, args.dset if args.dset else None)
+    assert args.mode in registery.get_options(), \
+           f"Unknown mode {args.mode}. Available: {registery.get_options()}"
+
+    # Special case: ETA/EATA needs loader
+    if args.mode in ["eta", "eata"]:
+        loader = get_webds_loader(dset_name, args.dset)
         model = registery.init(args.mode, model, loader, args.mode == "eta")
+    elif args.mode.startswith("rdumbpp_"):
+        # RDumb++ models need these kwargs
+        model = registery.init(
+            args.mode, model,
+            drift_k=args.drift_k,
+            warmup_steps=args.warmup,
+            cooldown_steps=args.cooldown,
+            soft_lambda=args.lambda_soft,
+            entropy_ema_alpha=args.ent_alpha,
+            kl_ema_alpha=args.kl_alpha
+        )
     else:
+        # Tent, RDumb, Pretrained, etc. - only need the model
         model = registery.init(args.mode, model)
 
-    test(model, dset_name, file_name=file_name, local_dset_path=args.dset if args.dset else None)
+    test(model, dset_name, file_name=file_name,
+         local_dset_path=args.dset)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--mode", type=str, default="tent", choices=registery.get_options()
-    )
+
+    parser.add_argument("--mode", type=str, default="tent",
+                        choices=registery.get_options())
     parser.add_argument("--processind", type=int, default=0)
     parser.add_argument("--baseline", type=float, default=20)
-    parser.add_argument("--logs", type=str)
-    parser.add_argument("--dset", type=str)
-    args = parser.parse_args()
+    parser.add_argument("--logs", type=str, required=True)
+    parser.add_argument("--dset", type=str, default=None)
 
+    # ---- RDumb++ PARAMETERS ----
+    parser.add_argument("--drift_k", type=float, default=3.0)
+    parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument("--cooldown", type=int, default=200)
+    parser.add_argument("--lambda_soft", type=float, default=0.5)
+    parser.add_argument("--ent_alpha", type=float, default=0.99)
+    parser.add_argument("--kl_alpha", type=float, default=0.99)
+
+    args = parser.parse_args()
     evaluate(args)
